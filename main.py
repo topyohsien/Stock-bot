@@ -129,15 +129,18 @@ def run_strategy(target_input):
     probs = model.predict_proba(test_df[features])[:, 1]
     buy_signal = probs > 0.50
 
-    # 模擬交易（包含訊號重置續抱邏輯）
+    # 模擬交易（追蹤單次完整交易點數與階段歷程）
     position = False
     buy_price = 0
     buy_date = ""
     hold_days = 0
+
+    original_buy_price = 0  # 紀錄最初進場價（用於計算真實單筆交易點數）
     original_buy_date = ""
 
     trade_logs = []
-    realized_profits = []
+    stage_realized_profits = []  # 階段損益列表
+    full_trade_pnl_list = []  # 真實完全出場單筆損益點數
 
     for i in range(1, len(test_df)):
         date_str = test_df.loc[i, "Date"].strftime("%Y-%m-%d")
@@ -148,6 +151,7 @@ def run_strategy(target_input):
             position = True
             buy_price = today_open
             buy_date = date_str
+            original_buy_price = today_open
             original_buy_date = date_str
             hold_days = 0
         elif position:
@@ -155,23 +159,23 @@ def run_strategy(target_input):
             open_pnl_pct = (today_open - buy_price) / buy_price
             pnl_val = today_open - buy_price
 
-            # 判斷是否觸發平倉條件
+            # 判斷是否觸發階段平倉條件
             is_tp = open_pnl_pct >= take_profit
             is_sl = open_pnl_pct <= stop_loss
             is_time_out = hold_days >= max_hold_days
 
             if is_tp or is_sl or is_time_out:
-                realized_profits.append(pnl_val)
+                stage_realized_profits.append(pnl_val)
                 trade_idx = len(trade_logs) + 1
 
                 if yesterday_signal:
-                    # 訊號重置續抱
+                    # 精確拆分三種續抱情境
                     if is_tp:
-                        reason = "停利續抱 🔄"
+                        reason = "停利重置續抱 🔄"
                     elif is_sl:
-                        reason = "訊號重置續抱 🔄"
+                        reason = "停損重置續抱 🔄"
                     else:
-                        reason = "訊號重置續抱 🔄"
+                        reason = "滿天數重置續抱 🔄"
 
                     if original_buy_date != buy_date:
                         log_str = f"第 {trade_idx:02d} 筆 | 原進場: {original_buy_date} (${buy_price:.1f}) -> 今日重置: {date_str} (${today_open:.1f}) | 階段損益: {pnl_val:+7.1f} ({open_pnl_pct*100:+5.1f}%) | {reason}"
@@ -180,12 +184,15 @@ def run_strategy(target_input):
 
                     trade_logs.append(log_str)
 
-                    # 重置成本與天數
+                    # 重置成本與天數，但保留最初 original_buy_price
                     buy_price = today_open
                     buy_date = date_str
                     hold_days = 0
                 else:
-                    # 完全平倉出場
+                    # 完全平倉出場：計算從最初進場到現在的真實單筆總損益
+                    full_trade_pnl = today_open - original_buy_price
+                    full_trade_pnl_list.append(full_trade_pnl)
+
                     if is_tp:
                         reason = "停利平倉 🎉"
                     elif is_sl:
@@ -242,11 +249,20 @@ def run_strategy(target_input):
         "==========================================================================="
     )
 
-    total_closed = len(realized_profits)
-    win_trades = sum(1 for p in realized_profits if p > 0)
-    loss_trades = sum(1 for p in realized_profits if p < 0)
+    # 階段階段與勝率統計
+    total_closed = len(stage_realized_profits)
+    win_trades = sum(1 for p in stage_realized_profits if p > 0)
+    loss_trades = sum(1 for p in stage_realized_profits if p < 0)
     win_rate = (win_trades / total_closed * 100) if total_closed > 0 else 0
-    total_pnl = sum(realized_profits)
+    total_pnl = sum(stage_realized_profits)
+
+    # 計算真實完整單筆交易的最大獲利與最大虧損
+    if full_trade_pnl_list:
+        max_single_win = max(full_trade_pnl_list)
+        max_single_loss = min(full_trade_pnl_list)
+    else:
+        max_single_win = 0.0
+        max_single_loss = 0.0
 
     output.append(
         f"📊 2024 至今已平倉交易筆數: {total_closed} 筆"
@@ -256,7 +272,13 @@ def run_strategy(target_input):
     )
     output.append(f"🎯 歷史已實現勝率: {win_rate:.2f}%")
     output.append(
-        f"📈 累積已實現獲利: {total_pnl:+0.1f} 元/點\n"
+        f"📈 累積已實現獲利: {total_pnl:+0.1f} 元/點"
+    )
+    output.append(
+        f"🚀 單次最大獲利點數 (完全出場): {max_single_win:+0.1f} 元/點"
+    )
+    output.append(
+        f"💥 單次最大虧損點數 (完全出場): {max_single_loss:+0.1f} 元/點\n"
     )
 
     output.append("★" * 42)
@@ -308,8 +330,6 @@ if __name__ == "__main__":
 
     for t in targets:
         report = run_strategy(t)
-        # 印在 GitHub Actions 的 Console Log 紀錄
         print(report)
         print("\n\n")
-        # 發送到 Telegram
         send_telegram_msg(report)
