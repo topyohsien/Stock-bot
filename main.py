@@ -19,14 +19,10 @@ def send_telegram_msg(message):
     if len(message) > 4000:
         chunks = [message[i : i + 4000] for i in range(0, len(message), 4000)]
         for chunk in chunks:
-            payload = {
-                "chat_id": CHAT_ID,
-                "text": chunk,
-                "parse_mode": "HTML",
-            }
+            payload = {"chat_id": CHAT_ID, "text": chunk}
             requests.post(url, json=payload)
     else:
-        payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML"}
+        payload = {"chat_id": CHAT_ID, "text": message}
         try:
             requests.post(url, json=payload)
         except Exception as e:
@@ -133,10 +129,15 @@ def run_strategy(target_input):
     probs = model.predict_proba(test_df[features])[:, 1]
     buy_signal = probs > 0.50
 
-    # 模擬交易與紀錄完整歷程
-    position, buy_price, buy_date, hold_days = False, 0, "", 0
-    trades, trades_pct = [], []
-    trade_logs = []  # 儲存歷史交易明細
+    # 模擬交易（包含訊號重置續抱邏輯）
+    position = False
+    buy_price = 0
+    buy_date = ""
+    hold_days = 0
+    original_buy_date = ""
+
+    trade_logs = []
+    realized_profits = []
 
     for i in range(1, len(test_df)):
         date_str = test_df.loc[i, "Date"].strftime("%Y-%m-%d")
@@ -144,100 +145,162 @@ def run_strategy(target_input):
         yesterday_signal = buy_signal[i - 1]
 
         if not position and yesterday_signal:
-            position, buy_price, buy_date, hold_days = (
-                True,
-                today_open,
-                date_str,
-                0,
-            )
+            position = True
+            buy_price = today_open
+            buy_date = date_str
+            original_buy_date = date_str
+            hold_days = 0
         elif position:
             hold_days += 1
             open_pnl_pct = (today_open - buy_price) / buy_price
+            pnl_val = today_open - buy_price
 
-            if (
-                open_pnl_pct >= take_profit
-                or open_pnl_pct <= stop_loss
-                or hold_days >= max_hold_days
-            ):
-                profit = today_open - buy_price
-                trades.append(profit)
-                trades_pct.append(open_pnl_pct)
+            # 判斷是否觸發平倉條件
+            is_tp = open_pnl_pct >= take_profit
+            is_sl = open_pnl_pct <= stop_loss
+            is_time_out = hold_days >= max_hold_days
 
-                # 判定平倉原因
-                if open_pnl_pct >= take_profit:
-                    reason = "🎯 停利"
-                elif open_pnl_pct <= stop_loss:
-                    reason = "✂️ 停損"
-                else:
-                    reason = "⏰ 到期"
-
-                log_entry = f"• {buy_date} 買進 ({buy_price:.1f}) ➔ {date_str} 出場 ({today_open:.1f}) | 損益: {open_pnl_pct*100:+5.2f}% ({reason})"
-                trade_logs.append(log_entry)
+            if is_tp or is_sl or is_time_out:
+                realized_profits.append(pnl_val)
+                trade_idx = len(trade_logs) + 1
 
                 if yesterday_signal:
-                    buy_price, buy_date, hold_days = today_open, date_str, 0
+                    # 訊號重置續抱
+                    if is_tp:
+                        reason = "停利續抱 🔄"
+                    elif is_sl:
+                        reason = "訊號重置續抱 🔄"
+                    else:
+                        reason = "訊號重置續抱 🔄"
+
+                    if original_buy_date != buy_date:
+                        log_str = f"第 {trade_idx:02d} 筆 | 原進場: {original_buy_date} (${buy_price:.1f}) -> 今日重置: {date_str} (${today_open:.1f}) | 階段損益: {pnl_val:+7.1f} ({open_pnl_pct*100:+5.1f}%) | {reason}"
+                    else:
+                        log_str = f"第 {trade_idx:02d} 筆 | 原進場: {buy_date} (${buy_price:.1f}) -> 今日重置: {date_str} (${today_open:.1f}) | 階段損益: {pnl_val:+7.1f} ({open_pnl_pct*100:+5.1f}%) | {reason}"
+
+                    trade_logs.append(log_str)
+
+                    # 重置成本與天數
+                    buy_price = today_open
+                    buy_date = date_str
+                    hold_days = 0
                 else:
+                    # 完全平倉出場
+                    if is_tp:
+                        reason = "停利平倉 🎉"
+                    elif is_sl:
+                        reason = "停損平倉 ✂️"
+                    else:
+                        reason = "滿天數平倉 ⏱️"
+
+                    log_str = f"第 {trade_idx:02d} 筆 | 進場: {buy_date} (${buy_price:.1f}) -> 出場: {date_str} (${today_open:.1f}) | 損益: {pnl_val:+7.1f} ({open_pnl_pct*100:+5.1f}%) | {reason}"
+                    trade_logs.append(log_str)
                     position = False
 
-    # 組立 Telegram 訊息
+    # 組立傳統純文字輸出報告
     last_row = test_df.iloc[-1]
     last_obs_date = last_row["Date"].strftime("%Y-%m-%d")
     last_close = float(last_row["Close"])
-    last_signal = buy_signal[-1]
 
-    msg = f"📌 <b>【{stock_name} ({stock_id}) 歷史回測與最新狀態】</b>\n\n"
+    train_start = df_clean[train_mask]["Date"].iloc[0].strftime("%Y-%m-%d")
+    train_end = df_clean[train_mask]["Date"].iloc[-1].strftime("%Y-%m-%d")
+    test_start = test_df["Date"].iloc[0].strftime("%Y-%m-%d")
+    avg_atr_pct = test_df["ATR_Pct"].mean() * 100
 
-    # 1. 歷史交易紀錄區塊
-    msg += "📜 <b>2024 年至今交易明細：</b>\n"
-    if trade_logs:
-        recent_logs = trade_logs[-15:]
-        msg += "\n".join(recent_logs) + "\n"
-        if len(trade_logs) > 15:
-            msg += f"<i>(已隱藏早期 {len(trade_logs)-15} 筆交易紀錄)</i>\n"
-    else:
-        msg += "尚無完成交易紀錄\n"
-
-    # 2. 總體統計績效
-    total_trades = len(trades)
-    win_rate = (
-        (sum(1 for t in trades if t > 0) / total_trades * 100)
-        if total_trades > 0
-        else 0
+    output = []
+    output.append(
+        "=================================================="
     )
-    total_return = sum(trades_pct) * 100 if trades_pct else 0
+    output.append(f"🔍 評估標的：{stock_name} ({stock_id})")
+    output.append(f"📊 平均日波動度 (ATR比率)：{avg_atr_pct:.2f}%")
+    output.append(
+        f"⚙️ 匹配風控參數：停利 {take_profit*100:+.1f}% | 停損 {stop_loss*100:+.1f}% | 最長持有 {max_hold_days} 天"
+    )
+    output.append(
+        "==================================================\n"
+    )
 
-    msg += f"\n📊 <b>回測績效總覽：</b>\n"
-    msg += f"• 總交易次數：{total_trades} 次\n"
-    msg += f"• 勝率：{win_rate:.1f}%\n"
-    msg += f"• 累計報酬率：{total_return:+6.2f}%\n"
+    output.append(
+        f"📅 方案 A 訓練區間：{train_start} ~ {train_end}"
+    )
+    output.append(
+        f"🎯 近期盲測區間：{test_start} ~ {last_obs_date}"
+    )
+    output.append(
+        "===========================================================================\n"
+    )
 
-    msg += "\n-----------------------------------\n"
-    msg += f"📅 資料日期：{last_obs_date}\n"
-    msg += f"📈 最新收盤價：{last_close:.1f}\n"
+    output.append(
+        f"=== {stock_name} ({stock_id}) 歷史『已平倉』交易明細 (2024 起至今) ==="
+    )
+    output.append(
+        "---------------------------------------------------------------------------"
+    )
+    for log in trade_logs:
+        output.append(log)
+    output.append(
+        "==========================================================================="
+    )
 
-    # 3. 當前最新狀態
+    total_closed = len(realized_profits)
+    win_trades = sum(1 for p in realized_profits if p > 0)
+    loss_trades = sum(1 for p in realized_profits if p < 0)
+    win_rate = (win_trades / total_closed * 100) if total_closed > 0 else 0
+    total_pnl = sum(realized_profits)
+
+    output.append(
+        f"📊 2024 至今已平倉交易筆數: {total_closed} 筆"
+    )
+    output.append(
+        f"🏆 獲利筆數: {win_trades} 筆 | 虧損筆數: {loss_trades} 筆"
+    )
+    output.append(f"🎯 歷史已實現勝率: {win_rate:.2f}%")
+    output.append(
+        f"📈 累積已實現獲利: {total_pnl:+0.1f} 元/點\n"
+    )
+
+    output.append("★" * 42)
+    output.append(
+        f"📌 【{stock_name} 當前最新交易狀態】 (資料更新至：{last_obs_date})"
+    )
+    output.append(f"📈 最新收盤價：{last_close:.1f}")
+    output.append("-" * 50)
+
     if position:
         unrealized_pnl = last_close - buy_price
         unrealized_pnl_pct = (unrealized_pnl / buy_price) * 100
         tp_price = buy_price * (1 + take_profit)
         sl_price = buy_price * (1 + stop_loss)
 
-        msg += f"🚨 <b>當前狀態：持倉中</b>\n"
-        msg += f"• 建倉日期：{buy_date}\n"
-        msg += f"• 買進成本：{buy_price:.1f}\n"
-        msg += f"• 持有天數：{hold_days} / {max_hold_days} 天\n"
-        msg += f"• 未實現損益：{unrealized_pnl:+7.1f} ({unrealized_pnl_pct:+5.2f}%)\n"
-        msg += f"• 🎯 停利價：{tp_price:.1f}\n"
-        msg += f"• ✂️ 停損價：{sl_price:.1f}\n"
-        msg += f"💡 建議：繼續持倉。\n"
-    elif last_signal:
-        msg += f"🛒 <b>當前狀態：發出買進訊號！</b>\n"
-        msg += f"💡 建議：明日 09:00 開盤價建立倉位。\n"
+        output.append("🚨 【狀態：持倉中 / 尚未平倉】")
+        output.append(
+            f"  • 最近一次建立/重置日期：{buy_date}"
+        )
+        output.append(
+            f"  • 最新基準成本 (開盤價)：{buy_price:.1f}"
+        )
+        output.append(
+            f"  • 當前段落已持有天數：{hold_days} / {max_hold_days} 天"
+        )
+        output.append(
+            f"  • 當前未實現損益：{unrealized_pnl:+0.1f} ({unrealized_pnl_pct:+0.2f}%)"
+        )
+        output.append(
+            f"  • 🎯 目標停利價：{tp_price:.1f} ({take_profit*100:+.1f}%)"
+        )
+        output.append(
+            f"  • ✂️ 防守停損價：{sl_price:.1f} ({stop_loss*100:+.1f}%)"
+        )
+        output.append(
+            "  💡 操作建議：持倉繼續有效，明晨 08:30 觀察是否觸發新目標價或滿天數。"
+        )
     else:
-        msg += f"💤 <b>當前狀態：觀望中</b>\n"
-        msg += f"💡 建議：保持觀望，暫不進場。\n"
+        output.append("💤 【狀態：空倉觀望】")
+        output.append("  💡 操作建議：目前無持倉，保持觀望。")
 
-    return msg
+    output.append("★" * 42)
+
+    return "\n".join(output)
 
 
 if __name__ == "__main__":
@@ -245,4 +308,8 @@ if __name__ == "__main__":
 
     for t in targets:
         report = run_strategy(t)
+        # 印在 GitHub Actions 的 Console Log 紀錄
+        print(report)
+        print("\n\n")
+        # 發送到 Telegram
         send_telegram_msg(report)
