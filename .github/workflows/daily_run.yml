@@ -3,7 +3,7 @@ name: Daily Stock Signal Telegram Push
 on:
   schedule:
     # UTC 時間 01:00 等於台灣時間 (UTC+8) 早上 09:00
-    - cron: '0 1 * * *'
+    - cron: '3 2 * * *'
   workflow_dispatch: # 支援手動按鈕測試執行
 
 jobs:
