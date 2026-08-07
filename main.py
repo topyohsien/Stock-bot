@@ -1,7 +1,8 @@
+import datetime
 import os
-import requests
 import numpy as np
 import pandas as pd
+import requests
 import yfinance as yf
 from sklearn.ensemble import RandomForestClassifier
 
@@ -12,33 +13,187 @@ BOT_TOKEN = os.getenv(
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "您的_CHAT_ID")
 
 
+# ==============================================================================
+# 1. 特徵工程輔助函式
+# ==============================================================================
+def get_before_holiday_feature(df):
+    """判斷今天是否為「連假/長假前最後一個交易日」"""
+    twse_custom_holidays = {
+        "2024-02-06",
+        "2024-02-07",
+        "2024-02-08",
+        "2024-02-09",
+        "2024-02-12",
+        "2024-02-13",
+        "2024-02-14",
+        "2024-02-28",
+        "2024-04-04",
+        "2024-04-05",
+        "2024-05-01",
+        "2024-06-10",
+        "2024-09-17",
+        "2024-10-10",
+        "2025-01-27",
+        "2025-01-28",
+        "2025-01-29",
+        "2025-01-30",
+        "2025-01-31",
+        "2025-02-28",
+        "2025-04-03",
+        "2025-04-04",
+        "2025-05-01",
+        "2025-05-30",
+        "2025-10-06",
+        "2025-10-10",
+        "2026-01-01",
+        "2026-02-16",
+        "2026-02-17",
+        "2026-02-18",
+        "2026-02-19",
+        "2026-02-20",
+        "2026-02-27",
+        "2026-04-03",
+        "2026-04-06",
+        "2026-05-01",
+        "2026-06-19",
+        "2026-09-25",
+        "2026-10-09",
+        "2026-10-12",
+    }
+
+    def is_market_closed(dt):
+        date_str = dt.strftime("%Y-%m-%d")
+        is_weekend = dt.weekday() >= 5
+        is_holiday = date_str in twse_custom_holidays
+        return is_weekend or is_holiday
+
+    is_before_holiday_list = []
+    for current_date in df["Date"]:
+        curr_dt = current_date.to_pydatetime()
+        consecutive_closed_days = 0
+        for next_day_offset in range(1, 6):
+            check_date = curr_dt + datetime.timedelta(days=next_day_offset)
+            if is_market_closed(check_date):
+                consecutive_closed_days += 1
+            else:
+                break
+        is_before_holiday_list.append(1 if consecutive_closed_days >= 3 else 0)
+
+    return is_before_holiday_list
+
+
+def get_txf_settlement_date(year, month):
+    """計算台指期結算日 (當月第 3 個星期三)"""
+    first_day = datetime.date(year, month, 1)
+    first_wednesday = first_day + datetime.timedelta(
+        days=(2 - first_day.weekday()) % 7
+    )
+    return first_wednesday + datetime.timedelta(days=14)
+
+
+def get_next_settlement_date(ref_date=None):
+    """計算未來最近台指期結算日"""
+    if ref_date is None:
+        ref_date = datetime.date.today()
+    elif isinstance(ref_date, (pd.Timestamp, datetime.datetime)):
+        ref_date = ref_date.date()
+
+    settlement_date = get_txf_settlement_date(ref_date.year, ref_date.month)
+    if ref_date > settlement_date:
+        if ref_date.month == 12:
+            settlement_date = get_txf_settlement_date(ref_date.year + 1, 1)
+        else:
+            settlement_date = get_txf_settlement_date(
+                ref_date.year, ref_date.month + 1
+            )
+    return settlement_date
+
+
+def add_settlement_features(df):
+    days_to_settlement, is_settlement_day, is_before_settlement = [], [], []
+    for dt in df["Date"]:
+        curr_date = dt.date()
+        settlement_date = get_next_settlement_date(curr_date)
+        days_diff = (settlement_date - curr_date).days
+        days_to_settlement.append(days_diff)
+        is_settlement_day.append(1 if days_diff == 0 else 0)
+        is_before_settlement.append(1 if 1 <= days_diff <= 2 else 0)
+
+    df["Days_To_Settlement"] = days_to_settlement
+    df["Is_Settlement_Day"] = is_settlement_day
+    df["Is_Before_Settlement"] = is_before_settlement
+    return df
+
+
+def add_advanced_behavior_features(df):
+    day_of_week, is_quarter_end, is_tsmc_earnings_window = [], [], []
+    is_ex_dividend_season, is_red_envelope_season = [], []
+
+    for dt in df["Date"]:
+        day_of_week.append(dt.weekday())
+        is_quarter_end.append(
+            1 if ((dt.month in [3, 6, 9, 12]) and (dt.day >= 24)) else 0
+        )
+        is_tsmc_earnings_window.append(
+            1 if ((dt.month in [1, 4, 7, 10]) and (12 <= dt.day <= 20)) else 0
+        )
+        is_ex_dividend_season.append(1 if dt.month in [6, 7, 8] else 0)
+        is_red_envelope_season.append(
+            1 if dt.month in [11, 12, 1, 2] else 0
+        )
+
+    df["Day_Of_Week"] = day_of_week
+    df["Is_Quarter_End"] = is_quarter_end
+    df["Is_TSMC_Earnings_Window"] = is_tsmc_earnings_window
+    df["Is_Ex_Dividend_Season"] = is_ex_dividend_season
+    df["Is_Red_Envelope_Season"] = is_red_envelope_season
+    return df
+
+
+def fetch_twd_exchange_rate(start_date="2018-01-01"):
+    twd_df = yf.download(
+        "TWD=X", start=start_date, auto_adjust=False, interval="1d"
+    )
+    if isinstance(twd_df.columns, pd.MultiIndex):
+        twd_df.columns = twd_df.columns.get_level_values(0)
+    twd_df = twd_df.dropna(subset=["Close"]).reset_index()
+    twd_df["Date"] = pd.to_datetime(twd_df["Date"])
+    twd_df["TWD_Return"] = twd_df["Close"].pct_change()
+    return twd_df[["Date", "TWD_Return"]]
+
+
+# ==============================================================================
+# 2. Telegram 發送模組
+# ==============================================================================
 def send_telegram_msg(message):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-
-    # Telegram 單則訊息字數限制 4096 字，若太長拆段發送
     if len(message) > 4000:
         chunks = [message[i : i + 4000] for i in range(0, len(message), 4000)]
         for chunk in chunks:
-            payload = {"chat_id": CHAT_ID, "text": chunk}
-            requests.post(url, json=payload)
+            requests.post(url, json={"chat_id": CHAT_ID, "text": chunk})
     else:
-        payload = {"chat_id": CHAT_ID, "text": message}
         try:
-            requests.post(url, json=payload)
+            requests.post(url, json={"chat_id": CHAT_ID, "text": message})
         except Exception as e:
             print(f"Telegram 發送失敗: {e}")
 
 
-def run_strategy(target_input):
-    # 自動處理代碼格式
+# ==============================================================================
+# 3. 主策略運算邏輯
+# ==============================================================================
+def run_strategy(target_input, twd_fx_df=None):
     if target_input.startswith("^"):
-        stock_id = target_input
-        ticker = target_input
-        stock_name = "台灣加權指數"
+        stock_id, ticker, stock_name = (
+            target_input,
+            target_input,
+            "台灣加權指數",
+        )
     elif target_input == "2330":
-        stock_id = target_input
-        ticker = f"{target_input}.TW"
-        stock_name = "台積電"
+        stock_id, ticker, stock_name = (
+            target_input,
+            f"{target_input}.TW",
+            "台積電",
+        )
     else:
         stock_id = target_input
         ticker = (
@@ -48,7 +203,6 @@ def run_strategy(target_input):
         )
         stock_name = target_input
 
-    # 抓取歷史資料
     df = yf.download(
         ticker, start="2018-01-01", auto_adjust=False, interval="1d"
     )
@@ -58,17 +212,24 @@ def run_strategy(target_input):
     df = df.dropna(subset=["Close"]).reset_index()
     df["Date"] = pd.to_datetime(df["Date"])
 
-    # 技術指標計算
+    # 技術指標
     df["Returns"] = df["Close"].pct_change()
     df["MA20"] = df["Close"].rolling(20).mean()
     df["Night_Gap"] = (df["Open"] - df["Close"].shift(1)) / df["Close"].shift(
         1
     )
 
-    high_low = df["High"] - df["Low"]
-    high_close = (df["High"] - df["Close"].shift()).abs()
-    low_close = (df["Low"] - df["Close"].shift()).abs()
-    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    tr = (
+        pd.concat(
+            [
+                df["High"] - df["Low"],
+                (df["High"] - df["Close"].shift()).abs(),
+                (df["Low"] - df["Close"].shift()).abs(),
+            ],
+            axis=1,
+        )
+        .max(axis=1)
+    )
     df["ATR14"] = tr.rolling(14).mean()
     df["ATR_Pct"] = df["ATR14"] / df["Close"]
 
@@ -91,18 +252,25 @@ def run_strategy(target_input):
     df["Retail_Panic"] = ((100 - df["RSI"]) / 100) * (
         df["Returns"].clip(upper=0).abs()
     )
+
+    # 特徵工程
+    df["Is_Before_Long_Holiday"] = get_before_holiday_feature(df)
+    df = add_settlement_features(df)
+    df = add_advanced_behavior_features(df)
+
+    if twd_fx_df is not None:
+        df = pd.merge(df, twd_fx_df, on="Date", how="left")
+        df["TWD_Return"] = df["TWD_Return"].ffill().fillna(0)
+    else:
+        df["TWD_Return"] = 0
+
     df["Target"] = (df["Close"].shift(-5) > df["Close"] * 1.01).astype(int)
     df_clean = df.dropna().copy().reset_index(drop=True)
 
-    # 風控參數
-    if stock_id == "^TWII":
-        take_profit, stop_loss, max_hold_days = 0.03, -0.02, 7
-    elif stock_id == "2330":
-        take_profit, stop_loss, max_hold_days = 0.04, -0.025, 7
-    else:
-        take_profit, stop_loss, max_hold_days = 0.03, -0.02, 7
+    take_profit, stop_loss, max_hold_days = (
+        (0.04, -0.025, 7) if stock_id == "2330" else (0.03, -0.02, 7)
+    )
 
-    # 模型訓練
     train_mask = (df_clean["Date"] >= "2018-01-01") & (
         df_clean["Date"] < "2024-01-01"
     )
@@ -120,7 +288,18 @@ def run_strategy(target_input):
         "OSC",
         "Retail_Overheat",
         "Retail_Panic",
+        "Is_Before_Long_Holiday",
+        "Days_To_Settlement",
+        "Is_Settlement_Day",
+        "Is_Before_Settlement",
+        "Day_Of_Week",
+        "Is_Quarter_End",
+        "Is_TSMC_Earnings_Window",
+        "Is_Ex_Dividend_Season",
+        "Is_Red_Envelope_Season",
+        "TWD_Return",
     ]
+
     model = RandomForestClassifier(
         n_estimators=100, max_depth=4, random_state=42
     )
@@ -129,18 +308,13 @@ def run_strategy(target_input):
     probs = model.predict_proba(test_df[features])[:, 1]
     buy_signal = probs > 0.50
 
-    # 模擬交易（追蹤單次完整交易點數與階段歷程）
+    # 回測模擬
     position = False
-    buy_price = 0
-    buy_date = ""
-    hold_days = 0
-
-    original_buy_price = 0  # 紀錄最初進場價（用於計算真實單筆交易點數）
-    original_buy_date = ""
+    buy_price, buy_date, hold_days = 0, "", 0
+    original_buy_price, original_buy_date = 0, ""
 
     trade_logs = []
-    stage_realized_profits = []  # 階段損益列表
-    full_trade_pnl_list = []  # 真實完全出場單筆損益點數
+    stage_realized_profits, full_trade_pnl_list = [], []
 
     for i in range(1, len(test_df)):
         date_str = test_df.loc[i, "Date"].strftime("%Y-%m-%d")
@@ -159,7 +333,6 @@ def run_strategy(target_input):
             open_pnl_pct = (today_open - buy_price) / buy_price
             pnl_val = today_open - buy_price
 
-            # 判斷是否觸發階段平倉條件
             is_tp = open_pnl_pct >= take_profit
             is_sl = open_pnl_pct <= stop_loss
             is_time_out = hold_days >= max_hold_days
@@ -169,94 +342,61 @@ def run_strategy(target_input):
                 trade_idx = len(trade_logs) + 1
 
                 if yesterday_signal:
-                    # 精確拆分三種續抱情境
-                    if is_tp:
-                        reason = "停利重置續抱 🔄"
-                    elif is_sl:
-                        reason = "停損重置續抱 🔄"
-                    else:
-                        reason = "滿天數重置續抱 🔄"
-
-                    if original_buy_date != buy_date:
-                        log_str = f"第 {trade_idx:02d} 筆 | 原進場: {original_buy_date} (${buy_price:.1f}) -> 今日重置: {date_str} (${today_open:.1f}) | 階段損益: {pnl_val:+7.1f} ({open_pnl_pct*100:+5.1f}%) | {reason}"
-                    else:
-                        log_str = f"第 {trade_idx:02d} 筆 | 原進場: {buy_date} (${buy_price:.1f}) -> 今日重置: {date_str} (${today_open:.1f}) | 階段損益: {pnl_val:+7.1f} ({open_pnl_pct*100:+5.1f}%) | {reason}"
-
-                    trade_logs.append(log_str)
-
-                    # 重置成本與天數，但保留最初 original_buy_price
-                    buy_price = today_open
-                    buy_date = date_str
-                    hold_days = 0
+                    reason = (
+                        "停利重置續抱 🔄"
+                        if is_tp
+                        else ("停損重置續抱 🔄" if is_sl else "滿天數重置續抱 🔄")
+                    )
+                    entry_date_display = (
+                        original_buy_date
+                        if original_buy_date != buy_date
+                        else buy_date
+                    )
+                    trade_logs.append(
+                        f"第 {trade_idx:02d} 筆 | 原進場: {entry_date_display} (${buy_price:.1f}) -> 重置: {date_str} (${today_open:.1f}) | 損益: {pnl_val:+7.1f} ({open_pnl_pct*100:+5.1f}%) | {reason}"
+                    )
+                    buy_price, buy_date, hold_days = today_open, date_str, 0
                 else:
-                    # 完全平倉出場：計算從最初進場到現在的真實單筆總損益
-                    full_trade_pnl = today_open - original_buy_price
-                    full_trade_pnl_list.append(full_trade_pnl)
-
-                    if is_tp:
-                        reason = "停利平倉 🎉"
-                    elif is_sl:
-                        reason = "停損平倉 ✂️"
-                    else:
-                        reason = "滿天數平倉 ⏱️"
-
-                    log_str = f"第 {trade_idx:02d} 筆 | 進場: {buy_date} (${buy_price:.1f}) -> 出場: {date_str} (${today_open:.1f}) | 損益: {pnl_val:+7.1f} ({open_pnl_pct*100:+5.1f}%) | {reason}"
-                    trade_logs.append(log_str)
+                    full_trade_pnl_list.append(today_open - original_buy_price)
+                    reason = (
+                        "停利平倉 🎉"
+                        if is_tp
+                        else ("停損平倉 ✂️" if is_sl else "滿天數平倉 ⏱️")
+                    )
+                    trade_logs.append(
+                        f"第 {trade_idx:02d} 筆 | 進場: {buy_date} (${buy_price:.1f}) -> 出場: {date_str} (${today_open:.1f}) | 損益: {pnl_val:+7.1f} ({open_pnl_pct*100:+5.1f}%) | {reason}"
+                    )
                     position = False
 
-    # 組立傳統純文字輸出報告
+    # 產出報告
     last_row = test_df.iloc[-1]
     last_obs_date = last_row["Date"].strftime("%Y-%m-%d")
     last_close = float(last_row["Close"])
-
-    train_start = df_clean[train_mask]["Date"].iloc[0].strftime("%Y-%m-%d")
-    train_end = df_clean[train_mask]["Date"].iloc[-1].strftime("%Y-%m-%d")
-    test_start = test_df["Date"].iloc[0].strftime("%Y-%m-%d")
-    avg_atr_pct = test_df["ATR_Pct"].mean() * 100
+    latest_signal = buy_signal[-1]
 
     output = []
-    output.append(
-        "=================================================="
-    )
+    output.append("==================================================")
     output.append(f"🔍 評估標的：{stock_name} ({stock_id})")
-    output.append(f"📊 平均日波動度 (ATR比率)：{avg_atr_pct:.2f}%")
+    output.append(f"📊 平均日波動度 (ATR)：{test_df['ATR_Pct'].mean()*100:.2f}%")
     output.append(
-        f"⚙️ 匹配風控參數：停利 {take_profit*100:+.1f}% | 停損 {stop_loss*100:+.1f}% | 最長持有 {max_hold_days} 天"
+        f"⚙️ 風控參數：停利 {take_profit*100:+.1f}% | 停損 {stop_loss*100:+.1f}% | 持有 {max_hold_days} 天"
     )
-    output.append(
-        "==================================================\n"
-    )
+    output.append("==================================================\n")
 
     output.append(
-        f"📅 方案 A 訓練區間：{train_start} ~ {train_end}"
-    )
-    output.append(
-        f"🎯 近期盲測區間：{test_start} ~ {last_obs_date}"
-    )
-    output.append(
-        "===========================================================================\n"
-    )
-
-    output.append(
-        f"=== {stock_name} ({stock_id}) 歷史『已平倉』交易明細 (2024 起至今) ==="
-    )
-    output.append(
-        "---------------------------------------------------------------------------"
+        f"=== {stock_name} ({stock_id}) 歷史『已平倉』明細 (2024 起) ==="
     )
     for log in trade_logs:
         output.append(log)
-    output.append(
-        "==========================================================================="
-    )
+    output.append("--------------------------------------------------")
 
-    # 階段階段與勝率統計
     total_closed = len(stage_realized_profits)
     win_trades = sum(1 for p in stage_realized_profits if p > 0)
     loss_trades = sum(1 for p in stage_realized_profits if p < 0)
     win_rate = (win_trades / total_closed * 100) if total_closed > 0 else 0
     total_pnl = sum(stage_realized_profits)
 
-    # 計算真實完整單筆交易的最大獲利與最大虧損
+    # 計算單次完全出場的最大獲利與最大虧損
     if full_trade_pnl_list:
         max_single_win = max(full_trade_pnl_list)
         max_single_loss = min(full_trade_pnl_list)
@@ -264,72 +404,100 @@ def run_strategy(target_input):
         max_single_win = 0.0
         max_single_loss = 0.0
 
-    output.append(
-        f"📊 2024 至今已平倉交易筆數: {total_closed} 筆"
-    )
-    output.append(
-        f"🏆 獲利筆數: {win_trades} 筆 | 虧損筆數: {loss_trades} 筆"
-    )
+    output.append(f"📊 2024 至今已平倉交易筆數: {total_closed} 筆")
+    output.append(f"🏆 獲利筆數: {win_trades} 筆 | 虧損筆數: {loss_trades} 筆")
     output.append(f"🎯 歷史已實現勝率: {win_rate:.2f}%")
-    output.append(
-        f"📈 累積已實現獲利: {total_pnl:+0.1f} 元/點"
-    )
-    output.append(
-        f"🚀 單次最大獲利點數 (完全出場): {max_single_win:+0.1f} 元/點"
-    )
-    output.append(
-        f"💥 單次最大虧損點數 (完全出場): {max_single_loss:+0.1f} 元/點\n"
-    )
+    output.append(f"📈 累積已實現獲利: {total_pnl:+0.1f} 元/點")
+    output.append(f"🚀 單次最大獲利點數 (完全出場): {max_single_win:+0.1f} 元/點")
+    output.append(f"💥 單次最大虧損點數 (完全出場): {max_single_loss:+0.1f} 元/點\n")
 
     output.append("★" * 42)
     output.append(
         f"📌 【{stock_name} 當前最新交易狀態】 (資料更新至：{last_obs_date})"
     )
     output.append(f"📈 最新收盤價：{last_close:.1f}")
-    output.append("-" * 50)
 
+    # 判斷明確操作動作 (續抱 / 平倉 / 買進 / 觀望)
     if position:
         unrealized_pnl = last_close - buy_price
         unrealized_pnl_pct = (unrealized_pnl / buy_price) * 100
-        tp_price = buy_price * (1 + take_profit)
-        sl_price = buy_price * (1 + stop_loss)
-
         output.append("🚨 【狀態：持倉中 / 尚未平倉】")
+        output.append(f"  • 持有成本：{buy_price:.1f} (天數: {hold_days}/{max_hold_days})")
         output.append(
-            f"  • 最近一次建立/重置日期：{buy_date}"
+            f"  • 未實現損益：{unrealized_pnl:+0.1f} ({unrealized_pnl_pct:+0.2f}%)"
         )
-        output.append(
-            f"  • 最新基準成本 (開盤價)：{buy_price:.1f}"
-        )
-        output.append(
-            f"  • 當前段落已持有天數：{hold_days} / {max_hold_days} 天"
-        )
-        output.append(
-            f"  • 當前未實現損益：{unrealized_pnl:+0.1f} ({unrealized_pnl_pct:+0.2f}%)"
-        )
-        output.append(
-            f"  • 🎯 目標停利價：{tp_price:.1f} ({take_profit*100:+.1f}%)"
-        )
-        output.append(
-            f"  • ✂️ 防守停損價：{sl_price:.1f} ({stop_loss*100:+.1f}%)"
-        )
-        output.append(
-            "  💡 操作建議：持倉繼續有效，明晨 08:30 觀察是否觸發新目標價或滿天數。"
-        )
+        action_summary = "🟢 建議【繼續持倉】(觀察明日是否觸發停利/停損/滿天數)"
     else:
-        output.append("💤 【狀態：空倉觀望】")
-        output.append("  💡 操作建議：目前無持倉，保持觀望。")
+        if latest_signal:
+            output.append("🚨 【狀態：觸發買進訊號】")
+            action_summary = "🚀 建議【明晨開盤買進】"
+        else:
+            output.append("💤 【狀態：空倉觀望】")
+            action_summary = "💤 建議【繼續空倉觀望】"
 
+    output.append(f"  👉 操作方向：{action_summary}")
+
+    next_settlement = get_next_settlement_date(last_row["Date"])
+    days_to_settlement = (next_settlement - last_row["Date"].date()).days
+    output.append(
+        f"🗓️ 下次台指期結算日：{next_settlement.strftime('%Y-%m-%d')} (剩 {days_to_settlement} 天)"
+    )
     output.append("★" * 42)
 
-    return "\n".join(output)
+    summary_info = {
+        "stock_name": stock_name,
+        "stock_id": stock_id,
+        "action": action_summary,
+        "last_date": last_obs_date,
+    }
+
+    return "\n".join(output), summary_info
 
 
+# ==============================================================================
+# 4. 主執行階段
+# ==============================================================================
 if __name__ == "__main__":
+    print("⏳ 正在取得美元兌台幣匯率歷史資料...")
+    twd_fx_df = fetch_twd_exchange_rate(start_date="2018-01-01")
+
     targets = ["2330", "^TWII"]
+    reports = []
+    summary_list = []
 
     for t in targets:
-        report = run_strategy(t)
-        print(report)
-        print("\n\n")
-        send_telegram_msg(report)
+        report_text, summary = run_strategy(t, twd_fx_df=twd_fx_df)
+        reports.append(report_text)
+        summary_list.append(summary)
+
+    # 1. 印出完整詳細報告
+    full_report = "\n\n".join(reports)
+    print(full_report)
+
+    # 2. 於【最底部】建立極度顯眼的「操作重點速查 Block」
+    upcoming_settlement = get_next_settlement_date(datetime.date.today())
+
+    bottom_summary = []
+    bottom_summary.append("\n" + "=" * 60)
+    bottom_summary.append("⚡【今日 / 明日 全標的操作重點速查卡】⚡")
+    bottom_summary.append("=" * 60)
+
+    for item in summary_list:
+        bottom_summary.append(
+            f"🔹 {item['stock_name']} ({item['stock_id']}) [{item['last_date']}]："
+        )
+        bottom_summary.append(f"   ➔ {item['action']}")
+
+    bottom_summary.append("-" * 60)
+    bottom_summary.append(
+        f"🗓️ 未來最近台指期結算日為：{upcoming_settlement.strftime('%Y-%m-%d')}"
+    )
+    bottom_summary.append("=" * 60)
+
+    bottom_summary_str = "\n".join(bottom_summary)
+
+    # 終端機最後印出重點摘要
+    print(bottom_summary_str)
+
+    # 發送 Telegram (詳細報告 + 底部重點摘要)
+    send_telegram_msg(full_report + "\n\n" + bottom_summary_str)
