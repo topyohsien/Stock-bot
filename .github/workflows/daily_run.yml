@@ -4,7 +4,7 @@ on:
   schedule:
     # UTC 時間 01:00 等於台灣時間 (UTC+8) 早上 09:00
     # - cron: '1 7 * * *'
-    - cron: '7 4 * * *'
+    - cron: '7 1 * * *'
   workflow_dispatch: # 支援手動按鈕測試執行
 
 jobs:
